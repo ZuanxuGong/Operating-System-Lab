@@ -1,0 +1,203 @@
+diff -Naur linux-2.6.9/arch/i386/kernel/entry.S linux-2.6.9lab4/arch/i386/kernel/entry.S
+--- linux-2.6.9/arch/i386/kernel/entry.S	2004-10-18 17:53:44.000000000 -0400
++++ linux-2.6.9lab4/arch/i386/kernel/entry.S	2018-10-31 21:15:45.000000000 -0400
+@@ -901,5 +901,7 @@
+ 	.long sys_mq_getsetattr
+ 	.long sys_ni_syscall		/* reserved for kexec */
+ 	.long sys_waitid
++	.long sys_cp_range 	        /* 285 */
++	.long sys_inc_cp_range
+ 
+ syscall_table_size=(.-sys_call_table)
+diff -Naur linux-2.6.9/include/asm-i386/unistd.h linux-2.6.9lab4/include/asm-i386/unistd.h
+--- linux-2.6.9/include/asm-i386/unistd.h	2004-10-18 17:54:37.000000000 -0400
++++ linux-2.6.9lab4/include/asm-i386/unistd.h	2018-10-31 21:17:02.000000000 -0400
+@@ -290,8 +290,10 @@
+ #define __NR_mq_getsetattr	(__NR_mq_open+5)
+ #define __NR_sys_kexec_load	283
+ #define __NR_waitid		284
++#define __NR_cp_range           285
++#define __NR_inc_cp_range       286
+ 
+-#define NR_syscalls 285
++#define NR_syscalls 287
+ 
+ /* user-visible error numbers are in the range -1 - -124: see <asm-i386/errno.h> */
+ 
+diff -Naur linux-2.6.9/include/linux/sched.h linux-2.6.9lab4/include/linux/sched.h
+--- linux-2.6.9/include/linux/sched.h	2004-10-18 17:53:13.000000000 -0400
++++ linux-2.6.9lab4/include/linux/sched.h	2018-10-30 23:09:55.000000000 -0400
+@@ -435,6 +435,7 @@
+ struct mempolicy;
+ 
+ struct task_struct {
++	int check_count;
+ 	volatile long state;	/* -1 unrunnable, 0 runnable, >0 stopped */
+ 	struct thread_info *thread_info;
+ 	atomic_t usage;
+diff -Naur linux-2.6.9/kernel/inc_cp_range.c linux-2.6.9lab4/kernel/inc_cp_range.c
+--- linux-2.6.9/kernel/inc_cp_range.c	1969-12-31 19:00:00.000000000 -0500
++++ linux-2.6.9lab4/kernel/inc_cp_range.c	2018-11-01 10:59:25.000000000 -0400
+@@ -0,0 +1,138 @@
++#include <linux/module.h>
++#include <asm/uaccess.h>
++#include <asm/current.h>
++#include <linux/kernel.h>
++#include <linux/mm.h>
++#include <linux/string.h>
++#include <linux/types.h>
++#include <linux/fs.h>
++long cp_range_internal(unsigned long *start_addr, unsigned long *end_addr,int inc);
++static struct file*  open_file(char* filename,mm_segment_t *old_fsp) {
++    struct file *filp=NULL;
++    *old_fsp = get_fs();
++    set_fs(KERNEL_DS);
++    filp = filp_open(filename, O_WRONLY|O_CREAT, 0644);
++    if (IS_ERR(filp)){
++        printk("Failed to open file!\n");
++        return NULL;
++    }
++    return  filp;                   
++}
++
++static void close_file(mm_segment_t old_fs,struct file *filp){
++    filp_close(filp,NULL);
++    set_fs(old_fs);
++}
++
++static pte_t *lookup_address_page(struct mm_struct* mm, unsigned long addr) {
++    pgd_t *pgd; 
++    pmd_t *pmd;
++    pte_t *ptep;
++    pte_t pte;
++    // Page Global Directory
++    pgd = pgd_offset(mm, addr);
++    if (pgd_none(*pgd) || pgd_bad(*pgd))
++        return NULL;
++    
++    // Page Middle Directory
++    pmd = pmd_offset(pgd, addr);
++    if (pmd_none(*pmd)||pmd_bad(*pmd))
++        return NULL;
++     ptep = pte_offset_map(pmd, addr);   
++    if(!ptep)
++	return NULL;
++    pte=*ptep;
++    if (pte_none(pte)||(pte_present(pte)&&(pte_page(pte)==ZERO_PAGE(addr)))){
++	  pte_unmap(ptep);
++	  return NULL;
++	}
++    return ptep;
++}
++
++static void walk_through_VMAs(unsigned long cp_start_addr,unsigned long cp_end_addr,int is_inc) {
++    struct task_struct *task;
++    struct mm_struct *mm;
++    struct vm_area_struct *area;
++    unsigned long addr;
++    pte_t *pte;
++    struct file *filp;
++    mm_segment_t old_fs;
++    char filename[32];
++    loff_t pos = 0;
++    memset((void*)filename,0,32);
++    if(is_inc){
++  	snprintf(filename, sizeof(filename), "inc_%d_%d", current->pid,current->check_count);
++	}else{
++      snprintf(filename, sizeof(filename), "cp_%d_%d", current->pid,current->check_count);
++  }
++ 
++    if ((filp=open_file(filename,&old_fs))) {
++        task = current;   
++        if (task->mm) {
++            mm = task->mm;
++         // area = task->mm->mmap;
++	    area=find_vma(mm,cp_start_addr);
++            while (area) {
++		if(area->vm_flags&VM_IO){
++			area = area->vm_next;
++			continue;
++		}
++		
++                addr = area->vm_start;
++                while (addr + PAGE_SIZE <= area->vm_end) {			
++                    if (addr >= cp_start_addr && addr + PAGE_SIZE <= cp_end_addr) {
++                        pte = lookup_address_page(mm, addr);
++                        if (pte && pte_read(*pte)) {
++			  //if is not inc checkpoint, or is inc check, but first check or page is dirty
++			  if(!is_inc||current->check_count==0||!pte_present(*pte)||pte_dirty(*pte)){
++			    if(is_inc&&pte_present(*pte)){
++				//try to clear dirty bits if it is incremental and 
++				ptep_test_and_clear_dirty(pte);
++			    }
++			    vfs_write(filp, &addr, sizeof(addr), &pos);
++                            vfs_write(filp, (void*)addr, PAGE_SIZE, &pos);
++                            vfs_write(filp, "\n", 1, &pos);
++				}
++ 			   pte_unmap(pte);
++                        }
++                    }
++                    addr += PAGE_SIZE;
++                }
++                area = area->vm_next;
++            }
++        }
++    }
++    close_file(old_fs,filp);
++
++}
++
++asmlinkage long sys_cp_range(unsigned long *start_addr, unsigned long *end_addr){
++	return cp_range_internal(start_addr,end_addr,0);
++}
++
++asmlinkage long sys_inc_cp_range(unsigned long *start_addr, unsigned long *end_addr){
++	return cp_range_internal(start_addr,end_addr,1);
++}
++
++long cp_range_internal(unsigned long *start_addr, unsigned long *end_addr,int inc){
++    unsigned long cp_start_addr;
++    unsigned long cp_end_addr;
++    printk(KERN_WARNING "Start basic checkpointing of memory\n");
++    if (copy_from_user(&cp_start_addr, start_addr, sizeof(*start_addr)))
++        return -EFAULT;
++    if (copy_from_user(&cp_end_addr, end_addr, sizeof(*end_addr)))
++        return -EFAULT;
++    
++   
++    printk(KERN_WARNING "\ncp_range is (%lx, %lx)\n", cp_start_addr, cp_end_addr);
++    if(cp_end_addr> TASK_SIZE)
++	{
++	  printk(KERN_ERR "address in kernel space");
++	  return -1;
++	}
++    walk_through_VMAs(cp_start_addr,cp_end_addr,inc);
++    printk(KERN_WARNING "Finish basic checkpointing of memory\n");
++    current->check_count++;
++    //++file_count;
++    return 0;
++}
+diff -Naur linux-2.6.9/kernel/Makefile linux-2.6.9lab4/kernel/Makefile
+--- linux-2.6.9/kernel/Makefile	2004-10-18 17:53:43.000000000 -0400
++++ linux-2.6.9lab4/kernel/Makefile	2018-11-01 09:49:42.000000000 -0400
+@@ -7,7 +7,7 @@
+ 	    sysctl.o capability.o ptrace.o timer.o user.o \
+ 	    signal.o sys.o kmod.o workqueue.o pid.o \
+ 	    rcupdate.o intermodule.o extable.o params.o posix-timers.o \
+-	    kthread.o
++	    kthread.o   inc_cp_range.o
+ 
+ obj-$(CONFIG_FUTEX) += futex.o
+ obj-$(CONFIG_GENERIC_ISA_DMA) += dma.o
+diff -Naur linux-2.6.9/Makefile linux-2.6.9lab4/Makefile
+--- linux-2.6.9/Makefile	2004-10-18 17:54:38.000000000 -0400
++++ linux-2.6.9lab4/Makefile	2018-10-26 23:27:01.000000000 -0400
+@@ -1,7 +1,7 @@
+ VERSION = 2
+ PATCHLEVEL = 6
+ SUBLEVEL = 9
+-EXTRAVERSION =
++EXTRAVERSION = lab4
+ NAME=Zonked Quokka
+ 
+ # *DOCUMENTATION*

@@ -1,0 +1,78 @@
+Authors: Yao Wei, Zuanxu Gong
+
+1.System Description.
+
+SFS(simple file system) is a single directory file system which supports the basic file read/write operation.
+SFS consists of three parts
+
+1.inode.c: 
+delete/update/read inode from or back to the image
+2.dir.c
+create/delete file
+create or remove hard link
+readdir
+3.file.c
+read or write data block
+
+
+2. To implement:
+Due to the limited time, haven't implement the permission module, SFS does not write the changing permission back to the image
+
+3. On Disk Layout
+-----------------------------------------------
+|	        super block (1 block)              |
+-----------------------------------------------
+|	         data map   (8 blocks)             |
+|                                              |
+-----------------------------------------------
+|	        inode  blocks  (256 blocks)        |
+|                                              |
+|                                              |
+|                                              |
+|                                              |
+|                                              |
+|                                              |
+|                                              |
+|                                              |
+-----------------------------------------------
+|	    data(dentry) blocks  (32 blocks)       |
+|                                              |
+|                                              |
+|                                              |
+|                                              |
+-----------------------------------------------
+|	        data   blocks  (n blocks)          |
+|                                              |
+|                                              |
+|                                              |
+|                                              |
+|                                              |
+|                                              |
+|                                              |
+|                                              |
+|                                              |
+|                                              |
+|                                              |
+|                                              |
+-----------------------------------------------
+
+Note: dentrymap and inodemap is included in the superblock
+4. Limitations:
+	- image file size: 		1 MB ~ 16 MB
+	- max number of inodes: 	1024
+	- max number of files:		1024
+	- max file size:		8 KB
+	- block size:			512 B
+	- max file name length:		12 B
+	- data block number:		1749 ~ 32469
+
+5. run
+#compile
+$ make
+#insmod
+$insmod lab5fs.ko
+#rmmod
+$rmmod lab5fs
+
+
+
